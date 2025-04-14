@@ -1,7 +1,6 @@
 package discord
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -53,11 +52,12 @@ type IntegrationTypesConfig struct {
 
 // External reference: https://discord.com/developers/docs/resources/application#application-object
 type App struct {
-	Id                uint64 `json:"-" discord-bot:"internal"` // ID of the app
-	PublicKey         string `json:"-" discord-bot:"internal"` // App Public Key
-	BotToken          string `json:"-" discord-bot:"internal"` // App Bot Token
-	DiscordApiBaseUrl string `json:"-" discord-bot:"internal"` // Discord base url; the base url used for requests to discord's REST api.
-	Color             int    `json:"-" discord-bot:"internal"` // Color
+	Id                uint64      `json:"-" discord-bot:"internal"` // ID of the app
+	PublicKey         string      `json:"-" discord-bot:"internal"` // App Public Key
+	BotToken          string      `json:"-" discord-bot:"internal"` // App Bot Token
+	DiscordApiBaseUrl string      `json:"-" discord-bot:"internal"` // Discord base url; the base url used for requests to discord's REST api.
+	Color             int         `json:"-" discord-bot:"internal"` // Color
+	Logger            *log.Logger `json:"-" discord-bot:"internal"` // The logger to use for application state changes.
 
 	Name                            string                 `json:"name"`                               // Name of the app
 	Icon                            string                 `json:"icon"`                               // Icon hash of the app
@@ -90,13 +90,9 @@ type App struct {
 	IntegrationTypesConfig          IntegrationTypesConfig `json:"integration_types_config"`           // Default scopes and permissions for each supported installation context. Value for each key is an integration type configuration object
 	CustomInstallUrl                string                 `json:"custom_install_url"`                 // Default custom authorization URL for the app, if enabled
 
-	send_heartbeat      bool
-	send_heartbeat_lock sync.RWMutex
-	last_sequence       *int
+	GatewayEventHandlers []utils.EventHandler  `json:"-" discord-bot:"internal"`
+	gatewayConnections   []*gateway.Connection `json:"-" discord-bot:"internal"`
 
-	GatewayEventHandlers []utils.EventHandler
-	registeredCommands   []RegisteredCommand
-	// InteractionWorkerChannels map[string]chan *gateway.InteractionCreate
 	HttpClient          *http.Client
 	ExternalConnections sync.WaitGroup
 }
@@ -248,14 +244,6 @@ type RegisteredCommand struct {
 	Fn                       *func(*gateway.Event, *App) error `json:"-"` // Callback function meant to handle interaction events for this command
 }
 
-type UnexpectedPayloadFormat struct {
-	Msg string
-}
-
-func (upf UnexpectedPayloadFormat) Error() string {
-	return upf.Msg
-}
-
 func (rc *RegisteredCommand) UnmarshalJSON(data []byte) error {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -269,42 +257,9 @@ func (rc *RegisteredCommand) UnmarshalJSON(data []byte) error {
 		}
 		rc.Id = &parsedID
 	} else {
-		return UnexpectedPayloadFormat{Msg: "Unexpected type"}
+		return fmt.Errorf("payload did not include 'id' field")
 	}
 
 	return nil
 
-}
-
-func (a *App) RegisterCommand(cmd any, handler func(*gateway.Event, *App) error) error {
-
-	// Serialize payload
-	cmdPayload, err := json.Marshal(&cmd)
-	if err != nil {
-		return err
-	}
-
-	// Create Request
-	request, err := http.NewRequest("POST", fmt.Sprintf("https://discord.com/api/applications/%v/commands", a.Id), bytes.NewReader(cmdPayload))
-	if err != nil {
-		return err
-	}
-
-	// Execute Request
-	responseBody, err := a.Make(request)
-	if err != nil {
-		return err
-	}
-
-	// Register Command Handler fn with app
-	var NewlyRegisteredCommand RegisteredCommand
-	NewlyRegisteredCommand.Fn = &handler                                // Add Callback Fn
-	decodeErr := json.Unmarshal(*responseBody, &NewlyRegisteredCommand) // Add remaining details returned by api
-	if decodeErr != nil {
-		return decodeErr
-	}
-
-	a.registeredCommands = append(a.registeredCommands, NewlyRegisteredCommand)
-
-	return nil
 }

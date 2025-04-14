@@ -1,8 +1,10 @@
 package common
 
-import "time"
+import (
+	"time"
+)
 
-// External Reference: https://discord.com/developers/docs/resources/guild#guild-object
+// External reference: https://discord.com/developers/docs/resources/guild#guild-object
 type Guild struct {
 	Id                          string         `json:"id"`                                      // guild id
 	Name                        string         `json:"name"`                                    // guild name (2-100 characters, excluding trailing and leading whitespace)
@@ -49,13 +51,19 @@ type Guild struct {
 	IncidentsData               *Incidents     `json:"incidents_data"`                          // the incidents data for this guild
 }
 
-// External Reference: https://discord.com/developers/docs/resources/guild#welcome-screen-object
+// External reference: https://discord.com/developers/docs/resources/guild#unavailable-guild-object
+type UnavailableGuild struct {
+	Id          string `json:"id"`
+	Unavailable bool   `json:"unavailable"`
+}
+
+// External reference: https://discord.com/developers/docs/resources/guild#welcome-screen-object
 type WelcomeScreen struct {
 	Description     *string                `json:"description"`      // the server description shown in the welcome screen
 	WelcomeChannels []WelcomeScreenChannel `json:"welcome_channels"` // the channels shown in the welcome screen, up to 5
 }
 
-// External Reference: https://discord.com/developers/docs/resources/guild#welcome-screen-object-welcome-screen-channel-structure
+// External reference: https://discord.com/developers/docs/resources/guild#welcome-screen-object-welcome-screen-channel-structure
 type WelcomeScreenChannel struct {
 	ChannelId   uint64  `json:"channel_id"`  // the channel's id
 	Description string  `json:"description"` // the description shown for the channel
@@ -63,13 +71,13 @@ type WelcomeScreenChannel struct {
 	EmojiName   *string `json:"emoji_name"`  // the emoji name if custom, the unicode character if standard, or null if no emoji is set
 }
 
-// External Reference: https://discord.com/developers/docs/resources/sticker#sticker-object-sticker-types
+// External reference: https://discord.com/developers/docs/resources/sticker#sticker-object-sticker-types
 var StickerTypes map[string]int = map[string]int{
 	"STANDARD": 1, // an official sticker in a pack
 	"GUILD":    2, // a sticker uploaded to a guild for the guild's members
 }
 
-// External Reference: https://discord.com/developers/docs/resources/sticker#sticker-object
+// External reference: https://discord.com/developers/docs/resources/sticker#sticker-object
 type Sticker struct {
 	Id          uint64  `json:"id"`                   // id of the sticker
 	PackId      *uint64 `json:"pack_id,omitempty"`    // for standard stickers, id of the pack the sticker is from
@@ -84,10 +92,56 @@ type Sticker struct {
 	SortValue   *int    `json:"sort_value,omitempty"` // the standard sticker's sort order within its pack
 }
 
-// External Reference: https://discord.com/developers/docs/resources/guild#incidents-data-object-incidents-data-structure
+// External reference: https://discord.com/developers/docs/resources/guild#incidents-data-object-incidents-data-structure
 type Incidents struct {
 	InvitesDisabledUntil *time.Time `json:"invites_disabled_until"`        // when invites get enabled again
 	DmsDisabledUntil     *time.Time `json:"dms_disabled_until"`            // when direct messages get enabled again
 	DmSpamDetectedAt     *time.Time `json:"dm_spam_detected_at,omitempty"` // when the dm spam was detected
 	RaidDetectedAt       *time.Time `json:"raid_detected_at"`              // when the raid was detected
+}
+
+// External reference: https://discord.com/developers/docs/resources/guild-scheduled-event#guild-scheduled-event-object
+type GuildScheduledEvent struct {
+	Id                 string          `json:"id"`                    // the id of the scheduled event
+	GuildId            string          `json:"guild_id"`              // the guild id which the scheduled event belongs to
+	ChannelId          *string         `json:"channel_id"`            // the channel id in which the scheduled event will be hosted, or null if scheduled entity type is EXTERNAL
+	CreatorId          *string         `json:"creator_id,omitempty"`  // the id of the user that created the scheduled event *
+	Name               string          `json:"name"`                  // the name of the scheduled event (1-100 characters)
+	Description        *string         `json:"description,omitempty"` // the description of the scheduled event (1-1000 characters)
+	ScheduledStartTime time.Time       `json:"scheduled_start_time"`  // the time the scheduled event will start
+	ScheduledEndTime   *time.Time      `json:"scheduled_end_time"`    // the time the scheduled event will end, required if entity_type is EXTERNAL
+	PrivacyLevel       uint8           `json:"privacy_level"`         // the privacy level of the scheduled event
+	Status             uint8           `json:"status"`                // the status of the scheduled event
+	EntityType         uint8           `json:"entity_type"`           // the type of the scheduled event
+	EntityId           *string         `json:"entity_id"`             // the id of an entity associated with a guild scheduled event
+	EntityMetadata     *EntityMetadata `json:"entity_metadata"`       // additional metadata for the guild scheduled event
+	Creator            *User           `json:"creator,omitempty"`     // the user that created the scheduled event
+	UserCount          *uint           `json:"user_count,omitempty"`  // the number of users subscribed to the scheduled event
+	Image              *string         `json:"image"`                 // the cover image hash of the scheduled event
+	RecurrenceRule     *RecurrenceRule `json:"recurrence_rule"`       // the definition for how often this event should recur
+}
+
+// External reference: https://discord.com/developers/docs/resources/guild-scheduled-event#guild-scheduled-event-object-guild-scheduled-event-entity-metadata
+type EntityMetadata struct {
+	Location *string `json:"location,omitempty"`
+}
+
+// External reference: https://discord.com/developers/docs/resources/guild-scheduled-event#guild-scheduled-event-recurrence-rule-object
+type RecurrenceRule struct {
+	Start      time.Time               `json:"start"`        // Starting time of the recurrence interval
+	End        *time.Time              `json:"end"`          // Ending time of the recurrence interval
+	Frequency  uint8                   `json:"frequency"`    // How often the event occurs
+	Interval   int                     `json:"interval"`     // The spacing between the events, defined by frequency. For example, frequency of WEEKLY and an interval of 2 would be "every-other week"
+	ByWeekday  *[]uint8                `json:"by_weekday"`   // Set of specific days within a week for the event to recur on
+	ByNWeekday *[]RecurrenceByNWeekday `json:"by_n_weekday"` // List of specific days within a specific week (1-5) to recur on
+	ByMonth    *[]uint8                `json:"by_month"`     // Set of specific months to recur on
+	ByMonthDay *[]uint8                `json:"by_month_day"` // Set of specific dates within a month to recur on
+	ByYearDay  *[]uint8                `json:"by_year_day"`  // Set of days within a year to recur on (1-364)
+	Count      *int                    `json:"count"`        // The total amount of times that the event is allowed to recur before stopping
+}
+
+// External reference: https://discord.com/developers/docs/resources/guild-scheduled-event#guild-scheduled-event-recurrence-rule-object-guild-scheduled-event-recurrence-rule-nweekday-structure
+type RecurrenceByNWeekday struct {
+	N   int   `json:"n"`
+	Day uint8 `json:"day"`
 }

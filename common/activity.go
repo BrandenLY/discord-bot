@@ -7,7 +7,7 @@ type Activity struct {
 	State *string `json:"state,omitempty"` // User's current party status, or text used for a custom status
 	Url   *string `json:"url,omitempty"`   // Stream URL, is validated when type is 1
 	// Bots cannot modify the fields below
-	CreatedAt     int     `json:"created_at"`               // Unix timestamp (in milliseconds) of when the activity was added to the user's session
+	CreatedAt     int64   `json:"created_at"`               // Unix timestamp (in milliseconds) of when the activity was added to the user's session
 	ApplicationId *uint64 `json:"application_id,omitempty"` // Application ID for the game
 	Details       *string `json:"details,omitempty"`        // What the player is currently doing
 	Instance      *bool   `json:"instance,omitempty"`       // Whether or not the activity is an instanced game session
