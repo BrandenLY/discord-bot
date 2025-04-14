@@ -8,14 +8,12 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
-	"time"
 
 	"brandenly.com/go/packages/discord-bot/common"
 	"brandenly.com/go/packages/discord-bot/gateway"
-	"brandenly.com/go/packages/discord-bot/utils"
 )
 
-var lastBeat time.Time = time.Now()
+const DiscordApiBaseUrl = "https://discord.com/api"
 
 var BotIntents map[string]int = map[string]int{
 	"GUILDS":                        1 << 0,
@@ -90,116 +88,89 @@ type App struct {
 	IntegrationTypesConfig          IntegrationTypesConfig `json:"integration_types_config"`           // Default scopes and permissions for each supported installation context. Value for each key is an integration type configuration object
 	CustomInstallUrl                string                 `json:"custom_install_url"`                 // Default custom authorization URL for the app, if enabled
 
-	GatewayEventHandlers []utils.EventHandler  `json:"-" discord-bot:"internal"`
+	GatewayEventHandlers []GatewayEventHandler `json:"-" discord-bot:"internal"`
 	gatewayConnections   []*gateway.Connection `json:"-" discord-bot:"internal"`
 
 	HttpClient          *http.Client
 	ExternalConnections sync.WaitGroup
 }
 
-// Establishes the handshake with the gateway and initiates heartbeat signaling.
-// func (a *App) ConnectGateway() {
+//// Core Methods
 
-// 	// Before your app can establish a connection to the Gateway, it should
-// 	// call the `Get Gateway` or the `Get Gateway Bot` endpoint. Either endpoint
-// 	// will return a payload with a url field whose value is the WSS URL you
-// 	// can use to open a WebSocket connection. In addition to the URL, Get
-// 	// Gateway Bot contains additional information about the recommended
-// 	// number of shards and the session start limits for your app.
+// Initialize application and establish gateway connections
+func (a *App) Start(config gateway.GatewayBotUrlResponse, identify *gateway.Event) error {
 
-// 	// https://discord.com/developers/docs/events/gateway#connecting
+	// Verify there are enough remaining session starts for reccomended shards
+	remaining, ok := config.SessionStartLimits["remaining"]
 
-// 	// ESTABLISH GATEWAY CONNECTION
-// 	// Format Gateway Url
-// 	gatewayUrl, _ := url.Parse(GatewayUrlResponse.Url)
-// 	urlQueryStr := gatewayUrl.Query()
-// 	urlQueryStr.Set("v", "10")
-// 	urlQueryStr.Set("encoding", "json")
-// 	gatewayUrl.RawQuery = urlQueryStr.Encode()
+	if !ok {
+		return fmt.Errorf("application did not receive session start limit data")
+	}
 
-// 	// Connect using the Gorilla WebSocket package
-// 	conn, _, err := websocket.DefaultDialer.Dial(gatewayUrl.String(), nil)
-// 	if err != nil {
-// 		log.Fatal("Failed to connect to Discord WebSocket gateway:", err)
-// 	}
+	if remaining < config.Shards {
+		return fmt.Errorf("not enough session starts remaining for reccomended shards")
+	}
 
-// 	a.ws = conn // Save websocket connection
+	// Introspect application details
+	a.HttpClient = &http.Client{}
 
-// 	// Receive Hello event
-// 	_, msg, err := a.ws.ReadMessage()
-// 	if err != nil {
-// 		log.Fatal("Unable to detect hello event")
-// 	}
+	req, err := http.NewRequest(
+		"GET",
+		fmt.Sprintf("%s/applications/@me", DiscordApiBaseUrl),
+		nil,
+	)
 
-// 	log.Printf("===INCOMING===\n%v\n\n", string(msg))
-// 	lastBeat = time.Now()
+	if err != nil {
+		return fmt.Errorf("unable to create request for application details: %w", err)
+	}
 
-// 	// Parse Hello event
-// 	var HelloEvent gateway.Event
-// 	helloEventDecodeErr := json.Unmarshal(msg, &HelloEvent)
-// 	if helloEventDecodeErr != nil {
-// 		log.Fatal("Unable to parse discord hello event", helloEventDecodeErr)
-// 	}
+	data, err := a.Make(req)
+	if err != nil {
+		return fmt.Errorf("request for application details failed: %w", err)
+	}
 
-// 	if HelloData, ok := HelloEvent.D.(gateway.Hello); ok {
-// 		log.Printf("Successfully connected to gateway.\n")
+	err = json.Unmarshal(*data, a)
+	if err != nil {
+		return fmt.Errorf("unable to unmarshal retrieved application details: %w", err)
+	}
 
-// 		a.ExternalConnections.Add(1)
-// 		go a.Receive() // Listen for responses
+	// Start gateway connections
 
-// 		a.ExternalConnections.Add(1)
-// 		go a.keepAlive(&HelloData.HeartbeatInterval) // Begin Heartbeat
+	for i := range config.Shards {
 
-// 		a.ExternalConnections.Add(1)
-// 		go a.Send() // Send payloads
+		var shardNum int = i + 1
 
-// 		// Configure Identify Event
-// 		e := gateway.Event{
-// 			Op: 2,
-// 			D: gateway.Identify{
-// 				Token: a.BotToken,
-// 				Properties: gateway.IdentifyConnProperties{
-// 					Os:      "windows",
-// 					Browser: "cockorman-inspector",
-// 					Device:  "cockorman-inspector",
-// 				},
-// 				Presence: common.Presence{
-// 					Activities: []common.Activity{
-// 						{
-// 							Name: "Gooning",
-// 							Type: 4,
-// 						},
-// 					},
-// 					Status: "online",
-// 					Afk:    false,
-// 				},
-// 				Intents: utils.FormIntents(
-// 					BotIntents["GUILDS"],
-// 					BotIntents["GUILD_BANS"],
-// 					BotIntents["GUILD_VOICE_STATES"],
-// 					BotIntents["GUILD_MESSAGES"],
-// 					BotIntents["GUILD_MESSAGE_REACTIONS"],
-// 					BotIntents["GUILD_MESSAGE_TYPING"],
-// 					BotIntents["MODERATE_MEMBERS"],
-// 					// PRIVILEGED INTENTS
-// 					// BotIntents["GUILD_PRESENCES"],
-// 					// BotIntents["GUILD_MEMBERS"],
-// 					// BotIntents["MESSAGE_CONTENT"],
-// 				),
-// 			},
-// 		}
+		a.Logger.Printf("Attempting to establish gateway connection %d/%d\n", shardNum, config.Shards)
 
-// 		// Send Identify Event
-// 		a.outgoing <- &e
-// 	}
+		var conn gateway.Connection = gateway.Connection{
+			Outgoing:   make(chan gateway.Event),
+			Incoming:   make(chan gateway.Event),
+			ShardIndex: i,
+			BotToken:   &a.BotToken,
+		}
 
-// }
+		err := conn.Connect(&config, identify)
+		if err != nil {
+			return fmt.Errorf("unable to start gateway connection %d", shardNum)
+		}
+
+		a.Logger.Printf("Gateway connection %d successfully connected", shardNum)
+
+		a.gatewayConnections = append(a.gatewayConnections, &conn)
+
+	}
+
+	a.ExternalConnections.Add(1)
+	go a.Receive()
+
+	return nil
+}
 
 // Makes an HTTP request to the Discord REST API
 func (a *App) Make(req *http.Request) (*[]byte, error) {
 
 	req.Header.Set("Authorization", fmt.Sprintf("Bot %v", a.BotToken)) // Set Authorization Header
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/json")                 // Set Content-Type Header
 
 	// Make Request
 	res, err := a.HttpClient.Do(req)
@@ -214,37 +185,52 @@ func (a *App) Make(req *http.Request) (*[]byte, error) {
 	}
 	defer res.Body.Close()
 
+	a.Logger.Printf("Outbound HTTP request to '%s' (Status code: %d)\n", req.URL.Path, res.StatusCode)
+
 	// Log error responses
 	if res.StatusCode >= 400 {
-		log.Printf("===FAILED API REQUEST=== %s\n%s\n\n", res.Status, &body)
+		return &body, fmt.Errorf("outbound http request received not okay status code: %d", res.StatusCode)
 	}
 
 	return &body, nil
 }
 
-// Convert Gateway Event Response to structs
-func parseGatewayResponse(payload []byte) (gateway.Event, error) {
+// Handle connections' incoming gateway events
+func (a *App) Receive() {
+	defer a.ExternalConnections.Done()
 
-	var event gateway.Event
-	err := json.Unmarshal(payload, &event)
+	for {
+		for _, conn := range a.gatewayConnections {
+			select {
+			case event := <-conn.Incoming:
 
-	return event, err
+				eventData, err := json.Marshal(event.D)
+				if err != nil {
+					panic(fmt.Errorf("unable to marshal incoming payload data: %w", err))
+				}
+
+				a.Logger.Printf("Incoming event (op: %d): %s\n", event.Op, eventData)
+
+				if event.Op == 0 { // Pass dispatch events to corresponding handlers
+					for _, handler := range a.GatewayEventHandlers {
+
+						if *event.T == handler.Type {
+							handler.Fn(&event, a) // Execute handler
+						}
+
+					}
+				}
+			default:
+				// Do nothing
+			}
+		}
+	}
 
 }
 
-type RegisteredCommand struct {
-	Id                       *uint64                           `json:"id,omitempty"`               // Unique ID of command
-	Type                     *uint8                            `json:"type,omitempty"`             // Type of command, defaults to 1
-	GuildId                  *uint64                           `json:"guild_id,omitempty"`         // Guild ID of the command, if not global
-	Name                     string                            `json:"name"`                       // Name of command, 1-32 characters
-	Description              string                            `json:"description"`                // Localization dictionary for name field. Values follow the same restrictions as name
-	DefaultMemberPermissions *string                           `json:"default_member_permissions"` // Set of permissions represented as a bit set
-	NSFW                     *bool                             `json:"nsfw,omitempty"`             // Indicates whether the command is age-restricted, defaults to false
-	Version                  uint64                            `json:"version"`
-	Fn                       *func(*gateway.Event, *App) error `json:"-"` // Callback function meant to handle interaction events for this command
-}
+//// Additional methods
 
-func (rc *RegisteredCommand) UnmarshalJSON(data []byte) error {
+func (a *App) UnmarshalJSON(data []byte) error {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -255,7 +241,7 @@ func (rc *RegisteredCommand) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return fmt.Errorf("failed to parse id: %w", err)
 		}
-		rc.Id = &parsedID
+		a.Id = parsedID
 	} else {
 		return fmt.Errorf("payload did not include 'id' field")
 	}
