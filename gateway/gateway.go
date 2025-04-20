@@ -1,11 +1,17 @@
 package gateway
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -13,22 +19,39 @@ import (
 )
 
 type Connection struct {
-	Outgoing                chan Event
-	Incoming                chan Event
-	ShardIndex              int
-	conn                    *websocket.Conn
-	connLock                sync.Mutex
-	gatewayUrl              *url.URL
+	ShardIndex int
+	Outgoing   chan Event
+	Incoming   chan Event
+	gatewayUrl *url.URL
+	conn       *websocket.Conn
+	ctx        context.Context
+	cancel     context.CancelFunc
+	active     bool
+
 	sessionId               *string
 	sessionResumeGatewayUrl *url.URL
-	active                  bool
 	lastSequence            *int
-	stopHeartbeats          chan bool
-	BotToken                *string
+	heartbeatInterval       uint
+
+	resumeLock sync.Mutex
+	BotToken   *string
+	Logger     *log.Logger
 }
 
 // External reference: https://discord.com/developers/docs/events/gateway#connecting
 func (c *Connection) Connect(config *GatewayBotUrlResponse, identifyEvent *Event) error {
+
+	if c.active {
+		return nil // Connection is already active
+	}
+
+	if c.ctx == nil {
+		c.ctx, c.cancel = context.WithCancel(context.Background())
+	}
+
+	if c.Logger == nil {
+		c.Logger = log.New(os.Stdout, fmt.Sprintf("[gateway-connection:%d]", c.ShardIndex+1), log.LstdFlags|log.Lshortfile)
+	}
 
 	// Cache WSS Url
 	if gatewayUrl, err := url.Parse(config.Url); err == nil {
@@ -53,58 +76,76 @@ func (c *Connection) Connect(config *GatewayBotUrlResponse, identifyEvent *Event
 	c.conn = conn
 	c.active = true
 
-	go c.receive() // Begin listening to events
 	go c.send()    // Begin sending events
+	go c.receive() // Begin listening to events
 
-	// Receive Hello event
-	hello := <-c.Incoming
-	helloData, ok := hello.D.(Hello)
-	if !ok {
-		return fmt.Errorf("unable to access hello event data")
+	// Receive Hello event & Identify
+	select {
+	case hello := <-c.Incoming:
+
+		helloData, ok := hello.D.(Hello)
+		if !ok {
+			return fmt.Errorf("unable to access hello event data")
+		}
+
+		c.heartbeatInterval = helloData.HeartbeatInterval
+		go c.sendHeartbeats(c.heartbeatInterval) // Send heartbeats
+
+		// Update identify payload with sharding info
+		identify, ok := identifyEvent.D.(Identify)
+		if !ok || identifyEvent.Op != 2 {
+			return fmt.Errorf("invalid identify payload")
+		}
+
+		identify.Shard = &[2]int{
+			c.ShardIndex,
+			config.Shards,
+		}
+
+		identifyEvent.D = identify
+
+		// Send Identify Payload
+		c.Outgoing <- *identifyEvent
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("timed out waiting for hello event")
 	}
-
-	go c.sendHeartbeats(helloData.HeartbeatInterval) // Send heartbeats
-
-	// Update identify payload with sharding info
-	identify, ok := identifyEvent.D.(Identify)
-	if !ok || identifyEvent.Op != 2 {
-		return fmt.Errorf("invalid identify payload")
-	}
-
-	identify.Shard = &[2]int{
-		c.ShardIndex,
-		config.Shards,
-	}
-
-	identifyEvent.D = identify
-
-	// Send Identify Payload
-	c.Outgoing <- *identifyEvent
 
 	return nil
 }
 
-// External reference:
+// External reference: https://discord.com/developers/docs/events/gateway#disconnecting
 func (c *Connection) Disconnect() error {
-	// Mark connection as inactive while we attempt to restore connection
-	c.active = false
+
+	c.Logger.Printf("Disconnecting gateway %d\n", c.ShardIndex+1)
+
+	c.cancel()       // Halt goroutines
+	c.active = false // Mark connection as inactive
+
+	time.Sleep(3 * time.Second)
 
 	// Close gateway connection gracefully
 	err := c.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "brb"))
 	if err != nil {
-		return fmt.Errorf("unable to gracefully close gateway connection: %w", err)
+		err = c.conn.Close()
+		if err != nil {
+			return fmt.Errorf("unable to close underlying websocket connection: %w", err)
+		}
+		return fmt.Errorf("unable to send close code to gateway during disconnect: %w", err)
 	}
+
 	c.conn.Close()
 
 	return nil
 }
 
-// External reference:
+// External reference: https://discord.com/developers/docs/events/gateway#resuming
 func (c *Connection) Resume() error {
+
+	c.Logger.Printf("Attempting to resume gateway connection %d\n", c.ShardIndex+1)
 
 	// Disconnect
 	if err := c.Disconnect(); err != nil {
-		return fmt.Errorf("failed to resume: %w", err)
+		return fmt.Errorf("disconnect failed: %w", err)
 	}
 
 	// Create new gateway connection
@@ -116,8 +157,13 @@ func (c *Connection) Resume() error {
 	c.conn = conn
 	c.active = true
 
-	go c.receive() // Begin listening to events
-	go c.send()    // Begin sending events
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+
+	time.Sleep(3 * time.Second)
+
+	go c.receive()                           // Begin listening to events
+	go c.send()                              // Begin sending events
+	go c.sendHeartbeats(c.heartbeatInterval) // Begin sending heartbeats
 
 	// Send Resume Event
 	var resume Event = Event{
@@ -153,55 +199,95 @@ func (c *Connection) Resume() error {
 	return nil
 }
 
-// Used to send fully-formed Gateway Event Objects to the gateway as a json string.
-//
 // Receives gateway events from the outgoing channel, marshals them, and sends them to the discord gateway.
 func (c *Connection) send() {
 
-	for msg := range c.Outgoing {
+	c.Logger.Printf("Gateway connection %d started sending (GID:%d)\n", c.ShardIndex+1, GetGID())
+	defer c.Logger.Printf("Gateway connection %d stopped sending (GID:%d)\n", c.ShardIndex+1, GetGID())
 
-		// Convert to byte array
-		payload, err := json.Marshal(msg)
-		if err != nil {
-			panic(fmt.Errorf("failed to Serialize payload to json: %+v", msg))
+	for {
+		select {
+
+		case <-c.ctx.Done():
+			return // Stop sending
+
+		case msg, ok := <-c.Outgoing:
+
+			if !ok {
+				return // Stop sending
+			}
+
+			// Convert to byte array
+			payload, err := json.Marshal(msg)
+			if err != nil {
+				panic(fmt.Errorf("failed to Serialize payload to json: %+v", msg))
+			}
+
+			// Send full payload
+			writeError := c.conn.WriteMessage(websocket.TextMessage, payload)
+			if writeError != nil {
+				panic(fmt.Errorf("an error occurred while sending data to the gateway: %v", writeError))
+			}
 		}
-
-		// Send full payload
-		c.connLock.Lock()
-		writeError := c.conn.WriteMessage(websocket.TextMessage, payload)
-		c.connLock.Unlock()
-
-		if writeError != nil {
-			panic(fmt.Errorf("an error occurred while sending data to the gateway: %v", writeError))
-		}
-
 	}
 
 }
 
-// Used to receive json from the gateway and convert them to native go objects.
-//
 // Listens to the active gateway connection and unmarshals incoming payloads before passing them to the incoming channel.
 func (c *Connection) receive() {
 
-	for c.active {
+	c.Logger.Printf("Gateway connection %d started receiving (GID:%d)", c.ShardIndex+1, GetGID())
+	defer c.Logger.Printf("Gateway connection %d stopped receiving (GID:%d)", c.ShardIndex+1, GetGID())
 
-		_, msg, err := c.conn.ReadMessage()
+	for {
+		select {
 
-		if err != nil {
+		case <-c.ctx.Done():
 
-			if websocket.IsCloseError(err, websocket.CloseAbnormalClosure) {
-				c.Resume() // Gateway closed unexpectedly, attempt resume.
-			} else {
-				panic(fmt.Errorf("unable to read incoming gateway event: %w", err))
+			c.Logger.Printf("Gateway connection %d asked to stop receiving (GID:%d)\n", c.ShardIndex+1, GetGID())
+			return // Stop receiving
+
+		default:
+
+			_, msg, err := c.conn.ReadMessage()
+
+			if err != nil {
+
+				if websocketCloseErr, ok := err.(*websocket.CloseError); ok {
+
+					// Handle clean close
+
+					c.Logger.Printf("Connection closed with close code: %+v", websocketCloseErr)
+
+				} else {
+
+					// Handle abrupt close
+
+					c.Logger.Printf("Connection closed without close code: %+v", err)
+
+				}
+
+				if c.active { // Attempt to resume
+
+					go func() {
+						err := c.Resume()
+						if err != nil {
+							c.Logger.Printf("Failed to resume after websocket closure: %s", err.Error())
+						}
+					}()
+
+				}
+
+				return
+
+			}
+
+			// Process incoming message
+			if len(msg) > 0 {
+				go c.processIncoming(msg)
 			}
 
 		}
-
-		if len(msg) > 0 {
-			go c.processIncoming(msg)
-		}
-
 	}
 
 }
@@ -219,7 +305,12 @@ func (c *Connection) processIncoming(message []byte) {
 		c.lastSequence = E.S
 	}
 
-	// Handle various event necessitated app updates
+	// Handle reconnect events
+	if E.Op == 7 {
+		c.Resume()
+	}
+
+	// Handle various dispatch event state updates
 	if E.Op == 0 {
 
 		if *E.T == "READY" {
@@ -256,22 +347,22 @@ func (c *Connection) processIncoming(message []byte) {
 // Handles the sending of heartbeat events at the specified interval
 func (c *Connection) sendHeartbeats(interval uint) {
 
-	c.stopHeartbeats = make(chan bool) // Create channel to receive notifications to stop.
+	intervalDur, err := time.ParseDuration(
+		fmt.Sprintf("%dms", interval),
+	)
+	if err != nil {
+		panic(err)
+	}
+	var t time.Ticker = *time.NewTicker(intervalDur)
 
 	for {
 		select {
 
-		case <-c.stopHeartbeats:
+		case <-c.ctx.Done():
 			return // Stop sending heartbeats
 
-		default:
+		case <-t.C:
 			// Process heartbeat
-			intervalDur, err := time.ParseDuration(
-				fmt.Sprintf("%dms", interval),
-			)
-			if err != nil {
-				panic(err)
-			}
 
 			// send heartbeat here
 			var Pulse Event = Event{
@@ -354,4 +445,20 @@ var closeIsResumable map[int]bool = map[int]bool{
 	4012: false, // Invalid API version
 	4013: false, // Invalid intent(s)
 	4014: false, // Disallowed intent(s)
+}
+
+// GetGID returns the current goroutine's ID (for debugging purposes only)
+func GetGID() uint64 {
+	b := make([]byte, 64)
+	b = b[:runtime.Stack(b, false)]
+	b = bytes.TrimPrefix(b, []byte("goroutine "))
+	i := bytes.IndexByte(b, ' ')
+	if i < 0 {
+		return 0
+	}
+	gid, err := strconv.ParseUint(string(b[:i]), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return gid
 }

@@ -142,7 +142,7 @@ var EventTypeStructs map[string]func() any = map[string]func() any{
 	// "INTEGRATION_CREATE": ,
 	// "INTEGRATION_UPDATE": ,
 	// "INTEGRATION_DELETE": ,
-	// "INTERACTION_CREATE": ,
+	"INTERACTION_CREATE": func() any { return &InteractionCreate{} },
 	// "INVITE_CREATE": ,
 	// "INVITE_DELETE": ,
 	// "MESSAGE_CREATE": ,

@@ -33,7 +33,7 @@ type ApplicationCommand struct {
 	DmPermissions            *bool                       `json:"dm_permission,omitempty"`             // Deprecated (use contexts instead); Indicates whether the command is available in DMs with the app, only for globally-scoped commands. By default, commands are visible.
 	DefaultPermission        *bool                       `json:"default_permission,omitempty"`        // Not recommended for use as field will soon be deprecated. Indicates whether the command is enabled by default when the app is added to a guild, defaults to true
 	Nsfw                     *bool                       `json:"nsfw,omitempty"`                      // Indicates whether the command is age-restricted, defaults to false
-	IntegrationTypes         *[]IntegrationType          `json:"integration_types,omitempty"`         // Installation contexts where the command is available, only for globally-scoped commands. Defaults to your app's configured contexts
+	IntegrationTypes         *[]uint8                    `json:"integration_types,omitempty"`         // Installation contexts where the command is available, only for globally-scoped commands. Defaults to your app's configured contexts
 	Contexts                 *[]uint8                    `json:"contexts,omitempty"`                  // Interaction context(s) where the command can be used, only for globally-scoped commands. By default, all interaction context types included for new commands.
 	Version                  string                      `json:"version"`                             // Autoincrementing version identifier updated during substantial record changes
 	Handler                  *uint8                      `json:"handler,omitempty"`                   // Determines whether the interaction is handled by the app's interactions handler or by Discord
@@ -71,10 +71,6 @@ type ApplicationCommandOptionChoice struct {
 	Name              string             `json:"name"`               //
 	NameLocalizations *map[string]string `json:"name_localizations"` //
 	Value             any                `json:"value"`
-}
-
-// External reference: https://discord.com/developers/docs/interactions/receiving-and-responding#interaction-object-interaction-context-types
-type IntegrationType struct {
 }
 
 // External reference: https://discord.com/developers/docs/interactions/application-commands#application-command-permissions-object

@@ -202,7 +202,12 @@ func (a *App) Receive() {
 	for {
 		for _, conn := range a.gatewayConnections {
 			select {
-			case event := <-conn.Incoming:
+			case event, ok := <-conn.Incoming:
+
+				if !ok {
+					// Channel is closed wait to see if its restored
+					continue
+				}
 
 				eventData, err := json.Marshal(event.D)
 				if err != nil {
@@ -215,7 +220,10 @@ func (a *App) Receive() {
 					for _, handler := range a.GatewayEventHandlers {
 
 						if *event.T == handler.Type {
-							handler.Fn(&event, a) // Execute handler
+							err := handler.Fn(&event, a) // Execute handler
+							if err != nil {
+								a.Logger.Printf("error occurred while executing event handler: %s", err.Error())
+							}
 						}
 
 					}
