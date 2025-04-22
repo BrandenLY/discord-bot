@@ -372,8 +372,6 @@ func (c *Connection) sendHeartbeats(interval uint) {
 
 			c.Outgoing <- Pulse
 
-			time.Sleep(intervalDur)
-
 		}
 
 	}
