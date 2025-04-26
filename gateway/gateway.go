@@ -307,7 +307,13 @@ func (c *Connection) processIncoming(message []byte) {
 
 	// Handle reconnect events
 	if E.Op == 7 {
-		c.Resume()
+		go func() {
+			err := c.Resume()
+			if err != nil {
+				c.Logger.Printf("Failed to resume after websocket closure: %s", err.Error())
+			}
+		}()
+		return
 	}
 
 	// Handle various dispatch event state updates

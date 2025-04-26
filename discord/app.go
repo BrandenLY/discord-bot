@@ -185,7 +185,7 @@ func (a *App) Make(req *http.Request) (*[]byte, error) {
 	}
 	defer res.Body.Close()
 
-	a.Logger.Printf("Outbound HTTP request to '%s' (Status code: %d)\n", req.URL.Path, res.StatusCode)
+	a.Logger.Printf("Outbound HTTP request to '%s' (Status code: %d)", req.URL.Path, res.StatusCode)
 
 	// Log error responses
 	if res.StatusCode >= 400 {
@@ -193,6 +193,22 @@ func (a *App) Make(req *http.Request) (*[]byte, error) {
 	}
 
 	return &body, nil
+}
+
+// Send a gateway event to one of the gateway connections
+func (a *App) Send(event gateway.Event, guildId string) error {
+
+	// Determine which shard should handle the event
+	guildIdInt, err := strconv.Atoi(guildId)
+	if err != nil {
+		return fmt.Errorf("unable to retrieve guild id as int: %w", err)
+	}
+
+	shardNum := (guildIdInt >> 22) % len(a.gatewayConnections)
+
+	a.Logger.Printf("Sending event to connection %d", shardNum)
+
+	return nil
 }
 
 // Handle connections' incoming gateway events
@@ -214,7 +230,11 @@ func (a *App) Receive() {
 					panic(fmt.Errorf("unable to marshal incoming payload data: %w", err))
 				}
 
-				a.Logger.Printf("Incoming event (op: %d): %s\n", event.Op, eventData)
+				if event.Op == 0 {
+					a.Logger.Printf("Incoming event %s (\"%s\"): %s\n", OpCodes[event.Op], *event.T, eventData)
+				} else {
+					a.Logger.Printf("Incoming event %s: %s\n", OpCodes[event.Op], eventData)
+				}
 
 				if event.Op == 0 { // Pass dispatch events to corresponding handlers
 					for _, handler := range a.GatewayEventHandlers {
