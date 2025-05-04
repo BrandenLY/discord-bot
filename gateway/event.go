@@ -34,7 +34,8 @@ func (e *Event) UnmarshalJSON(data []byte) error {
 	e.S = raw.S   // This field does not require modification
 	e.T = raw.T   // This field does not require modification
 
-	if raw.Op == 0 { // Dispatch
+	// Dispatch
+	if raw.Op == 0 {
 
 		constructor, ok := EventTypeStructs[*raw.T]
 		if !ok {
@@ -58,13 +59,20 @@ func (e *Event) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 
-	if raw.Op == 7 { // Reconnect event
+	// Reconnect event
+	if raw.Op == 7 {
 		e.D = raw.D
 		return nil
 	}
 
-	if raw.Op == 9 { // Invalid Session event
-		e.D = raw.D
+	// Invalid Session event
+	if raw.Op == 9 {
+		var val bool
+		err := json.Unmarshal(raw.D, &val)
+		if err != nil {
+			return fmt.Errorf("unable to parse invalid session event: %w", err)
+		}
+		e.D = val
 		return nil
 	}
 
@@ -94,7 +102,6 @@ var EventTypeStructs map[string]func() any = map[string]func() any{
 	"READY": func() any { return &Ready{} },
 	// "RESUMED": ,
 	// "RECONNECT": ,
-	// "INVALID_SESSION": ,
 	"APPLICATION_COMMAND_PERMISSIONS_UPDATE": func() any { return &common.ApplicationCommandPermissions{} },
 	"AUTO_MODERATION_RULE_CREATE":            func() any { return &common.AutoModerationRule{} },
 	"AUTO_MODERATION_RULE_UPDATE":            func() any { return &common.AutoModerationRule{} },

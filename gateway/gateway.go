@@ -22,95 +22,137 @@ type Connection struct {
 	ShardIndex int
 	Outgoing   chan Event
 	Incoming   chan Event
+	BotToken   *string
+	Logger     *log.Logger
 	gatewayUrl *url.URL
 	conn       *websocket.Conn
 	ctx        context.Context
 	cancel     context.CancelFunc
 	active     bool
 
-	sessionId               *string
-	sessionResumeGatewayUrl *url.URL
-	lastSequence            *int
-	heartbeatInterval       uint
+	heartbeatInterval uint
+	session           session
+	parentCtx         context.Context
+}
 
-	resumeLock sync.Mutex
-	BotToken   *string
-	Logger     *log.Logger
+type session struct {
+	Id               *string
+	ResumeGatewayUrl *url.URL
+	LastSequence     *int
+	Wg               sync.WaitGroup
+	InvalidSession   chan any
+	SuccessfulResume chan any
+	NewSession       chan any
 }
 
 // External reference: https://discord.com/developers/docs/events/gateway#connecting
-func (c *Connection) Connect(config *GatewayBotUrlResponse, identifyEvent *Event) error {
+func (c *Connection) Connect(ctx context.Context, wg *sync.WaitGroup, config *GatewayBotUrlResponse, identifyEvent *Event) error {
 
+	// Inform external api's that the connection is fully closed.
+	defer wg.Done()
+
+	// Prevent consecutive calls to Connection.Connect()
 	if c.active {
-		return nil // Connection is already active
+		return fmt.Errorf("cannot call Connect() on an already active connection instance") // Connection is already active
 	}
 
-	if c.ctx == nil {
-		c.ctx, c.cancel = context.WithCancel(context.Background())
-	}
-
+	// Configure logger, this can be set externally so it is only created if not provided
 	if c.Logger == nil {
 		c.Logger = log.New(os.Stdout, fmt.Sprintf("[gateway-connection:%d]", c.ShardIndex+1), log.LstdFlags|log.Lshortfile)
 	}
 
 	// Cache WSS Url
-	if gatewayUrl, err := url.Parse(config.Url); err == nil {
-
-		urlQuery := gatewayUrl.Query()
-		urlQuery.Set("v", "10")
-		urlQuery.Set("encoding", "json")
-		gatewayUrl.RawQuery = urlQuery.Encode()
-
-		c.gatewayUrl = gatewayUrl
-
-	} else {
+	gatewayUrl, err := url.Parse(config.Url)
+	if err != nil {
 		return fmt.Errorf("unable to format gateway url: %w", err)
 	}
 
-	// Store websocket connection object
-	conn, _, err := websocket.DefaultDialer.Dial(c.gatewayUrl.String(), nil)
-	if err != nil {
-		return err
+	urlQuery := gatewayUrl.Query()
+	urlQuery.Set("v", "10")
+	urlQuery.Set("encoding", "json")
+	gatewayUrl.RawQuery = urlQuery.Encode()
+
+	c.gatewayUrl = gatewayUrl
+
+	// Create invalid session channel
+	c.session.InvalidSession = make(chan any)
+
+	// Create invalid session channel
+	c.session.NewSession = make(chan any)
+
+	// Create successful resume channel
+	c.session.SuccessfulResume = make(chan any)
+
+	// Cache outer context
+	c.parentCtx = ctx
+
+	for {
+		select {
+		case <-ctx.Done():
+			err := c.Disconnect()
+			if err != nil {
+				return fmt.Errorf("unable to close connection gracefully: %w", err)
+			}
+			return nil
+		default:
+
+			// Reset wait group
+			c.session.Wg = sync.WaitGroup{}
+
+			// Reset context
+			c.ctx, c.cancel = context.WithCancel(c.parentCtx)
+
+			// Store websocket connection object
+			conn, _, err := websocket.DefaultDialer.Dial(c.gatewayUrl.String(), nil)
+			if err != nil {
+				return err
+			}
+
+			c.conn = conn
+			c.active = true
+
+			c.session.Wg.Add(3) // send(), receive(), sendHeartbeats()
+
+			go c.send()    // Begin sending events
+			go c.receive() // Begin listening to events
+
+			// Receive Hello event & Identify
+			select {
+			case hello := <-c.Incoming:
+
+				helloData, ok := hello.D.(Hello)
+				if !ok {
+					return fmt.Errorf("unable to access hello event data")
+				}
+
+				c.heartbeatInterval = helloData.HeartbeatInterval
+				go c.sendHeartbeats(c.heartbeatInterval) // Send heartbeats
+
+				// Update identify payload with sharding info
+				identify, ok := identifyEvent.D.(Identify)
+				if !ok || identifyEvent.Op != 2 {
+					return fmt.Errorf("invalid identify payload")
+				}
+
+				identify.Shard = &[2]int{
+					c.ShardIndex,
+					config.Shards,
+				}
+
+				identifyEvent.D = identify
+
+				// Send Identify Payload
+				c.Outgoing <- *identifyEvent
+			case <-time.After(10 * time.Second):
+				return fmt.Errorf("timed out waiting for hello event")
+			}
+
+			// Wait for active session to close
+			<-c.session.NewSession
+			c.Logger.Printf("Attempting full reconnection")
+		}
 	}
 
-	c.conn = conn
-	c.active = true
-
-	go c.send()    // Begin sending events
-	go c.receive() // Begin listening to events
-
-	// Receive Hello event & Identify
-	select {
-	case hello := <-c.Incoming:
-
-		helloData, ok := hello.D.(Hello)
-		if !ok {
-			return fmt.Errorf("unable to access hello event data")
-		}
-
-		c.heartbeatInterval = helloData.HeartbeatInterval
-		go c.sendHeartbeats(c.heartbeatInterval) // Send heartbeats
-
-		// Update identify payload with sharding info
-		identify, ok := identifyEvent.D.(Identify)
-		if !ok || identifyEvent.Op != 2 {
-			return fmt.Errorf("invalid identify payload")
-		}
-
-		identify.Shard = &[2]int{
-			c.ShardIndex,
-			config.Shards,
-		}
-
-		identifyEvent.D = identify
-
-		// Send Identify Payload
-		c.Outgoing <- *identifyEvent
-	case <-time.After(10 * time.Second):
-		return fmt.Errorf("timed out waiting for hello event")
-	}
-
-	return nil
 }
 
 // External reference: https://discord.com/developers/docs/events/gateway#disconnecting
@@ -118,22 +160,22 @@ func (c *Connection) Disconnect() error {
 
 	c.Logger.Printf("Disconnecting gateway %d\n", c.ShardIndex+1)
 
-	c.cancel()       // Halt goroutines
 	c.active = false // Mark connection as inactive
-
-	time.Sleep(3 * time.Second)
+	c.cancel()       // Halt goroutines
 
 	// Close gateway connection gracefully
 	err := c.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "brb"))
 	if err != nil {
-		err = c.conn.Close()
-		if err != nil {
-			return fmt.Errorf("unable to close underlying websocket connection: %w", err)
-		}
-		return fmt.Errorf("unable to send close code to gateway during disconnect: %w", err)
+		// Do nothing
 	}
 
-	c.conn.Close()
+	err = c.conn.Close()
+	if err != nil {
+		// Do nothing
+	}
+
+	// Ensure all goroutines exited
+	c.session.Wg.Wait()
 
 	return nil
 }
@@ -149,18 +191,17 @@ func (c *Connection) Resume() error {
 	}
 
 	// Create new gateway connection
-	conn, _, err := websocket.DefaultDialer.Dial(c.sessionResumeGatewayUrl.String(), nil)
+	conn, _, err := websocket.DefaultDialer.Dial(c.session.ResumeGatewayUrl.String(), nil)
 	if err != nil {
 		return fmt.Errorf("unable to connect to prior session: %w", err)
 	}
 
 	c.conn = conn
 	c.active = true
+	c.session.Wg = sync.WaitGroup{}
+	c.ctx, c.cancel = context.WithCancel(c.parentCtx)
 
-	c.ctx, c.cancel = context.WithCancel(context.Background())
-
-	time.Sleep(3 * time.Second)
-
+	c.session.Wg.Add(3)
 	go c.receive()                           // Begin listening to events
 	go c.send()                              // Begin sending events
 	go c.sendHeartbeats(c.heartbeatInterval) // Begin sending heartbeats
@@ -170,33 +211,46 @@ func (c *Connection) Resume() error {
 		Op: 6,
 		D: Resume{
 			Token:     *c.BotToken,
-			SessionId: *c.sessionId,
-			Seq:       *c.lastSequence,
+			SessionId: *c.session.Id,
+			Seq:       *c.session.LastSequence,
 		},
 	}
-
 	c.Outgoing <- resume
 
-	// Check for invalid session response
-	firstNewEvent := <-c.Incoming
+	// Wait for resume result update
+	select {
+	case <-time.After(1 * time.Minute):
+		return fmt.Errorf("resume function never received status update")
 
-	if firstNewEvent.Op == 9 { // Received an invalid session op code
+	case msg := <-c.session.InvalidSession:
 
-		canReconnect, ok := firstNewEvent.D.(bool)
+		// Parse event
+		E, ok := msg.(Event)
 		if !ok {
-			return fmt.Errorf("invalid session event 'D' is unexpected type; expected bool")
+			return fmt.Errorf("resume received unexpected channel message type")
 		}
 
-		if canReconnect {
+		// Parse event data
+		canResume, ok := E.D.(bool)
+		if !ok {
+			return fmt.Errorf("resume received unexpected channel message event data type")
+		}
+
+		// Check resumability
+		if canResume {
 			c.Resume()
+			return nil
 		} else {
 			c.Disconnect()
-			panic(fmt.Errorf("gateway connection could not resume"))
+			c.session.NewSession <- E
+			return nil
 		}
 
+	case <-c.session.SuccessfulResume:
+		c.Logger.Printf("Successfully resumed gateway connection")
+		return nil
 	}
 
-	return nil
 }
 
 // Receives gateway events from the outgoing channel, marshals them, and sends them to the discord gateway.
@@ -204,6 +258,7 @@ func (c *Connection) send() {
 
 	c.Logger.Printf("Gateway connection %d started sending (GID:%d)\n", c.ShardIndex+1, GetGID())
 	defer c.Logger.Printf("Gateway connection %d stopped sending (GID:%d)\n", c.ShardIndex+1, GetGID())
+	defer c.session.Wg.Done()
 
 	for {
 		select {
@@ -238,13 +293,13 @@ func (c *Connection) receive() {
 
 	c.Logger.Printf("Gateway connection %d started receiving (GID:%d)", c.ShardIndex+1, GetGID())
 	defer c.Logger.Printf("Gateway connection %d stopped receiving (GID:%d)", c.ShardIndex+1, GetGID())
+	defer c.session.Wg.Done()
 
 	for {
 		select {
 
 		case <-c.ctx.Done():
 
-			c.Logger.Printf("Gateway connection %d asked to stop receiving (GID:%d)\n", c.ShardIndex+1, GetGID())
 			return // Stop receiving
 
 		default:
@@ -297,12 +352,18 @@ func (c *Connection) processIncoming(message []byte) {
 	var E Event
 	err := json.Unmarshal(message, &E)
 	if err != nil {
-		panic(fmt.Errorf("unable to parse incoming gateway event: %w", err))
+		c.Logger.Printf("FAILED TO PARSE INCOMING GATEWAY EVENT: %s", err.Error())
+		return
 	}
 
 	// Update sequence number
 	if E.S != nil {
-		c.lastSequence = E.S
+		c.session.LastSequence = E.S
+	}
+
+	// Handle successful resume
+	if E.Op == 9 {
+		c.session.InvalidSession <- E
 	}
 
 	// Handle reconnect events
@@ -326,7 +387,7 @@ func (c *Connection) processIncoming(message []byte) {
 				panic(fmt.Errorf("ready event data could not be accessed"))
 			}
 
-			c.sessionId = &readyData.SessionId
+			c.session.Id = &readyData.SessionId
 
 			// Cache WSS Url
 			if resumeGatewayUrl, err := url.Parse(readyData.ResumeGatewayUrl); err == nil {
@@ -336,12 +397,16 @@ func (c *Connection) processIncoming(message []byte) {
 				urlQuery.Set("encoding", "json")
 				resumeGatewayUrl.RawQuery = urlQuery.Encode()
 
-				c.sessionResumeGatewayUrl = resumeGatewayUrl
+				c.session.ResumeGatewayUrl = resumeGatewayUrl
 
 			} else {
 				panic(fmt.Errorf("unable to parse session resume gateway url: %w", err))
 			}
 
+		}
+
+		if *E.T == "RESUMED" {
+			c.session.SuccessfulResume <- E
 		}
 
 	}
@@ -352,6 +417,8 @@ func (c *Connection) processIncoming(message []byte) {
 
 // Handles the sending of heartbeat events at the specified interval
 func (c *Connection) sendHeartbeats(interval uint) {
+
+	defer c.session.Wg.Done()
 
 	intervalDur, err := time.ParseDuration(
 		fmt.Sprintf("%dms", interval),
@@ -373,7 +440,7 @@ func (c *Connection) sendHeartbeats(interval uint) {
 			// send heartbeat here
 			var Pulse Event = Event{
 				Op: 1,
-				D:  c.lastSequence,
+				D:  c.session.LastSequence,
 			}
 
 			c.Outgoing <- Pulse

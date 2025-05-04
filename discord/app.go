@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +14,7 @@ import (
 	"brandenly.com/go/packages/discord-bot/gateway"
 )
 
-const DiscordApiBaseUrl = "https://discord.com/api"
+const ApiBaseUrl = "https://discord.com/api"
 
 var BotIntents map[string]int = map[string]int{
 	"GUILDS":                        1 << 0,
@@ -89,6 +90,8 @@ type App struct {
 	CustomInstallUrl                string                 `json:"custom_install_url"`                 // Default custom authorization URL for the app, if enabled
 
 	GatewayEventHandlers []GatewayEventHandler `json:"-" discord-bot:"internal"`
+	Cancel               context.CancelFunc    `json:"-" discord-bot:"internal"`
+	ctx                  context.Context       `json:"-" discord-bot:"internal"`
 	gatewayConnections   []*gateway.Connection `json:"-" discord-bot:"internal"`
 
 	HttpClient          *http.Client
@@ -98,7 +101,10 @@ type App struct {
 //// Core Methods
 
 // Initialize application and establish gateway connections
-func (a *App) Start(config gateway.GatewayBotUrlResponse, identify *gateway.Event) error {
+func (a *App) Start(ctx context.Context, config gateway.GatewayBotUrlResponse, identify *gateway.Event) error {
+
+	// Cache context
+	a.ctx = ctx
 
 	// Verify there are enough remaining session starts for reccomended shards
 	remaining, ok := config.SessionStartLimits["remaining"]
@@ -116,7 +122,7 @@ func (a *App) Start(config gateway.GatewayBotUrlResponse, identify *gateway.Even
 
 	req, err := http.NewRequest(
 		"GET",
-		fmt.Sprintf("%s/applications/@me", DiscordApiBaseUrl),
+		fmt.Sprintf("%s/applications/@me", ApiBaseUrl),
 		nil,
 	)
 
@@ -135,7 +141,7 @@ func (a *App) Start(config gateway.GatewayBotUrlResponse, identify *gateway.Even
 	}
 
 	// Start gateway connections
-
+	a.ExternalConnections.Add(config.Shards)
 	for i := range config.Shards {
 
 		var shardNum int = i + 1
@@ -149,18 +155,18 @@ func (a *App) Start(config gateway.GatewayBotUrlResponse, identify *gateway.Even
 			BotToken:   &a.BotToken,
 		}
 
-		err := conn.Connect(&config, identify)
-		if err != nil {
-			return fmt.Errorf("unable to start gateway connection %d", shardNum)
-		}
+		go func() {
+			err := conn.Connect(a.ctx, &a.ExternalConnections, &config, identify)
+			if err != nil {
+				panic(fmt.Errorf("unable to start gateway connection %d", shardNum))
+			}
+		}()
 
 		a.Logger.Printf("Gateway connection %d successfully connected", shardNum)
 
 		a.gatewayConnections = append(a.gatewayConnections, &conn)
-
 	}
 
-	a.ExternalConnections.Add(1)
 	go a.Receive()
 
 	return nil
