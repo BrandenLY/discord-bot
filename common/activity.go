@@ -6,6 +6,7 @@ type Activity struct {
 	Type  uint8   `json:"type"`            // Activity type
 	State *string `json:"state,omitempty"` // User's current party status, or text used for a custom status
 	Url   *string `json:"url,omitempty"`   // Stream URL, is validated when type is 1
+	Emoji *Emoji  `json:"emoji,omitempty"` // Emoji used for a custom status
 	// Bots cannot modify the fields below
 	CreatedAt     int64   `json:"created_at"`               // Unix timestamp (in milliseconds) of when the activity was added to the user's session
 	ApplicationId *uint64 `json:"application_id,omitempty"` // Application ID for the game
